@@ -13,8 +13,8 @@
 #ifndef HAL_FSK_CONFIG_H_
 #define HAL_FSK_CONFIG_H_
 
-// #define USE_VERSION_2   /* V2: PIT + CMP + FTM (input capture / output compare) */
-#define USE_VERSION_1      /* V1: ADC + DAC + DMA                                  */
+#define USE_VERSION_2   /* V2: PIT + CMP + FTM (input capture / output compare) */
+//#define USE_VERSION_1      /* V1: ADC + DAC + DMA                                  */
 
 #if defined(USE_VERSION_1) && defined(USE_VERSION_2)
 #  error "Definir solo UNA version (USE_VERSION_1 o USE_VERSION_2)"
