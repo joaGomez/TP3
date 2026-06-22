@@ -49,7 +49,7 @@ void 		ADC_ClearInterruptFlag (ADC_t);
 void 		ADC_SetResolution 	   (ADC_t, ADCBits_t);
 ADCBits_t 	ADC_GetResolution 	   (ADC_t);
 void 		ADC_SetCycles	 	   (ADC_t, ADCCycles_t);
-ADCCycles_t ADC_GetCycles	 	   (ADC_t);
+ADCCycles_t ADC_GetCycles	 	   (ADC_t);   /* [FIX] antes el .c definia ADC_GetSCycles */
 void 		ADC_SetHardwareAverage (ADC_t, ADCTaps_t);
 ADCTaps_t   ADC_GetHardwareAverage (ADC_t);
 
@@ -60,5 +60,13 @@ void 		ADC_Start 			   (ADC_t, ADCChannel_t, ADCMux_t);
 bool 		ADC_IsReady 	       (ADC_t);
 
 ADCData_t 	ADC_getData 		   (ADC_t);
+
+/* [NUEVO] Configura ADC0 para la cadena de RX de la V1:
+ *   - canal 'channel' (12 = PTB2 = A0), 12 bits
+ *   - disparo por HARDWARE desde PIT0 (SIM_SOPT7), conversion continua por trigger
+ *   - peticiones de DMA habilitadas (SC2[DMAEN]) -> el eDMA copia R[0] a un buffer
+ * El PIT0 (frecuencia de muestreo) y el canal de DMA se configuran aparte.
+ */
+void 		ADC_ConfigRxHwTriggerDMA (ADCChannel_t channel);
 
 #endif /* SOURCES_TEMPLATE_ADC_H_ */

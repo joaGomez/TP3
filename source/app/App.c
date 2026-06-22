@@ -19,8 +19,11 @@
 // ============================================================================
 // CONFIGURACIÓN DE SELECCIÓN DE ENTREGA
 // ============================================================================
-// #define USE_VERSION_2   // <-- Descomentar para compilar la V2 (PIT + CMP + FTM)
-#define USE_VERSION_1   // <-- Descomentar para compilar la V1 (ADC + DAC + DMA)
+// [FIX] La seleccion de version vive ahora en hal/fsk_config.h, incluida por
+// TODAS las unidades de compilacion (App.c, timers.c, FSK_V1.c, FSK_V2.c...).
+// Definir USE_VERSION_x solo aca dejaba a timers.c sin sus ISRs. No editar el
+// switch aqui: editarlo en hal/fsk_config.h.
+#include "hal/fsk_config.h"
 
 
 

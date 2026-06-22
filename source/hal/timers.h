@@ -33,6 +33,15 @@ void PIT_ConfigureChannel(pit_channel_t channel, uint32_t us, pit_callback_t cal
 /**
  * @brief Detiene un canal del PIT
  */
+
+/**
+ * @brief Configura un canal del PIT como FUENTE DE TRIGGER periodica (sin IRQ).
+ *        Util para disparar por hardware el ADC (via SIM_SOPT7) o el eDMA.
+ * @param channel Canal (0 a 3)
+ * @param ldval_ticks Valor de recarga (ticks del reloj del PIT, ej: 50 MHz)
+ */
+void PIT_ConfigureTrigger(pit_channel_t channel, uint32_t ldval_ticks);
+
 void PIT_StopChannel(pit_channel_t channel);
 
 /**

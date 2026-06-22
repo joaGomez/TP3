@@ -1,6 +1,17 @@
 /***************************************************************************//**
   @file     DAC.c
-  @brief    Driver del Conversor Digital-Analógico (DAC) para streaming por DMA
+  @brief    Driver del Conversor Digital-Analogico (DAC) - streaming por DMA.
+
+  Nota de diseno (corregida):
+   - Con el buffer del DAC DESHABILITADO (DACBFEN=0, reset), DAT[0] es la salida
+     "viva": cada escritura a DAT[0] aparece inmediatamente en la salida. No hace
+     falta trigger ni se generan peticiones de DMA desde el DAC.
+   - Por eso el ritmo de muestreo (Fs) lo impone una fuente EXTERNA que dispara el
+     eDMA (en la V1: un canal de FTM en free-run -> DMA -> DAT[0]). Ver FSK_V1.c.
+   - [FIX] El codigo anterior ponia DACTRGSEL=1 (que es trigger por SOFTWARE, no
+     por hardware como decia el comentario) y DACDMAEN=1 esperando que el DAC
+     pidiera DMA; con el buffer deshabilitado eso nunca ocurre, asi que la cadena
+     de TX no transmitia. Aqui se deja el DAC en modo "registro vivo".
  ******************************************************************************/
 
 #include "DAC.h"
@@ -8,49 +19,29 @@
 
 #define DAC_DATL_DATA0_WIDTH 8
 
-/**
- * @brief Inicializa el DAC0 configurado específicamente para trabajar con DMA
- */
 void DAC_Init(void)
 {
-    // 1. Habilitar el Clock Gating para el periférico DAC0
+    // 1. Clock gating del DAC0
     SIM->SCGC2 |= SIM_SCGC2_DAC0_MASK;
 
-    // 2. Inicializar el primer elemento del buffer en el punto medio (1.65V)
-    // para evitar un transitorio brusco al encender el sistema (Offset 2048)
+    // 2. Valor inicial = media escala (1.65 V) para evitar transitorio al arrancar
     DAC0->DAT[0].DATL = DAC_DATL_DATA0(2048);
     DAC0->DAT[0].DATH = DAC_DATH_DATA1(2048 >> DAC_DATL_DATA0_WIDTH);
 
-    /* 3. Configuración del Registro de Control 0 (C0):
-     * - DACEN: Habilita el módulo DAC.
-     * - DACRFS: Selecciona la referencia de tensión de la placa (VDDA = 3.3V).
-     * - DACTRGSEL: 1 = TRIGGER POR HARDWARE (Esencial para que el Timer/DMA dicten el ritmo).
-     */
-    DAC0->C0 = DAC_C0_DACEN_MASK | DAC_C0_DACRFS_MASK | DAC_C0_DACTRGSEL_MASK;
+    // 3. C0: habilitar DAC y referencia = VDDA (3.3 V). Buffer deshabilitado
+    //    (DACBFEN=0) => DAT[0] es la salida viva. DACTRGSEL/DMAEN no se usan.
+    DAC0->C0 = DAC_C0_DACEN_MASK | DAC_C0_DACRFS_MASK;
 
-    /* 4. Configuración del Registro de Control 1 (C1):
-     * - DACDMAEN: Habilita los requerimientos de DMA. Cada vez que el DAC reciba
-     * un trigger de hardware, le pedirá un nuevo dato al módulo eDMA.
-     */
-    DAC0->C1 = DAC_C1_DMAEN_MASK;
-
-    /* 5. Configuración del Registro de Control 2 (C2):
-     * - Coloca el puntero del buffer en 0. Como no usamos el buffer interno
-     * del DAC en modo circular propio, lo dejamos apuntando siempre al registro 0.
-     */
+    // 4. C1 / C2 en reset (sin buffer, sin DMA propio del DAC)
+    DAC0->C1 = 0;
     DAC0->C2 = 0;
 }
 
-/**
- * @brief Permite una escritura manual por software (Útil para debug o calibración)
- */
 void DAC_SetData(DAC_t dac, DACData_t data)
 {
-    // Aseguramos que el dato no sature los 12 bits de resolución (0 a 4095)
     if (data > 4095) {
         data = 4095;
     }
-
     dac->DAT[0].DATL = DAC_DATL_DATA0(data);
     dac->DAT[0].DATH = DAC_DATH_DATA1(data >> DAC_DATL_DATA0_WIDTH);
 }

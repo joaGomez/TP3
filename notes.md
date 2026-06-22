@@ -1,0 +1,3 @@
+- V1
+  - Entrada: ADC B2
+  - Salida: DAC DAC0_OUT

@@ -1,71 +1,176 @@
 /***************************************************************************//**
   @file     FSK_V1.c
-  @brief    Módem FSK Bell 202 (Capa HAL) - Versión 1 (TX por DMA + DAC)
+  @brief    Modem FSK Bell 202 - Version 1 (ADC + DAC + DMA).
+
+  TX (DMA -> DAC):
+    - Generacion por DDS (acumulador de fase) => fase CONTINUA y duracion de bit
+      CONSTANTE (833 us), sin los huecos del esquema anterior (que usaba una LUT
+      de "un ciclo == un bit", rompiendo el timing para 2200 Hz).
+    - El eDMA transmite SPB muestras por bit a DAC0->DAT[0]. El ritmo (Fs) lo da
+      un canal de FTM0 en free-run (fuente real del DMAMUX) -> evita el erratum
+      e4588 del periodic-trigger del PIT y el hecho de que, con el buffer del DAC
+      deshabilitado, el DAC nunca pide DMA por si mismo.
+    - Doble buffer (ping-pong): al terminar el major loop (== un bit), la ISR del
+      DMA rellena el siguiente bit continuando la fase.
+    - La linea transmite MARK continuo (1200 Hz) en reposo, para que el RX tenga
+      un reposo "mark" valido y pueda detectar el flanco de start.
+
+  RX (DMA <- ADC):
+    - PIT0 dispara por HW el ADC0 a Fs; el ADC pide DMA por cada COCO; el eDMA
+      copia R[0] a un ring circular. La DSP (fsk_demod, validada en host) consume
+      el ring en FSK_V1_PeriodicTask.
+
+  PUNTOS A VERIFICAR EN HARDWARE (no se pudieron probar aqui):
+    - Reloj de FTM0 (asumido 50 MHz) -> FTM0_MOD para Fs (osciloscopio).
+    - Numero de fuente DMAMUX de FTM0_CH0 (asumido 20) y bit DMA en CnSC.
+    - Relacion SADDR-swap vs. primer request del nuevo major loop (margen ~41 us).
  ******************************************************************************/
 
+#include "fsk_config.h"
 #include "FSK_V1.h"
+#include "timers.h"
 #include "MK64F12.h"
 #include "mcal/DAC.h"
 #include "mcal/DMA.h"
 #include "mcal/ADC.h"
+#include "fsk_demod.h"
 #include <math.h>
 #include <stddef.h>
 
 /*******************************************************************************
- * CONSTANTES Y CONFIGURACIONES
+ * PARAMETROS
  ******************************************************************************/
-#define FSAMPLING               22000U      // Frecuencia de muestreo (22 kHz)
-#define PI                      3.14159265358979323846f
+#define FS_HZ            24000U          /* Fs de TX y RX (SPB entero)          */
+#define BAUDRATE         1200U
+#define SPB              (FS_HZ/BAUDRATE)/* 20 muestras por bit                 */
+#define FL_HZ            1200U           /* mark = 1                            */
+#define FH_HZ            2200U           /* space = 0                           */
 
-#define BAUDRATE                1200U
-#define BIT_TIME_US             833U        // 1 / 1200 Baudios
+#define PIT_CLOCK_HZ     50000000U
+#define FTM0_CLOCK_HZ    50000000U       /* VERIFICAR reloj real del FTM        */
 
-// Cantidad de muestras necesarias por bit para cada frecuencia a 22kHz
-#define SAMPLES_PER_BIT_MARK    18     // 22000 / 1200 ≈ 18 muestras
-#define SAMPLES_PER_BIT_SPACE   10     // 22000 / 2200 = 10 muestras
+#define SINE_LUT_SIZE    256U
+#define DAC_CENTER       2048
+#define DAC_AMPL         1900            /* amplitud (deja headroom 12 bits)    */
 
-#define DMAMUX_SOURCE_DAC0      45     // ID de la fuente de hardware DAC0 en K64F
+/* incrementos de fase (Q32): inc = f * 2^32 / Fs */
+#define PHASE_INC_MARK   ((uint32_t)(((uint64_t)FL_HZ << 32) / FS_HZ))
+#define PHASE_INC_SPACE  ((uint32_t)(((uint64_t)FH_HZ << 32) / FS_HZ))
+
+#define ADC_CH_A0        12U             /* PTB2 = ADC0_SE12 = A0               */
+#define RX_RING_LEN      256U
 
 /*******************************************************************************
- * TABLES DE BÚSQUEDA EN RAM (Look-Up Tables)
- ******************************************************************************/
-// Almacenamos buffers precargados con un bit completo de duración para cada frecuencia
-static uint16_t lut_mark_bit[SAMPLES_PER_BIT_MARK];
-static uint16_t lut_space_bit[SAMPLES_PER_BIT_SPACE];
-
-/*******************************************************************************
- * VARIABLES DE ESTADO LOCALES
+ * ESTADO
  ******************************************************************************/
 static fsk_v1_rx_callback_t rx_callback = NULL;
 
-static volatile bool tx_busy = false;
-static uint8_t tx_bit_buffer[11];
-static volatile int8_t current_bit_idx = -1;
+/* --- TX --- */
+static int16_t  sine_lut[SINE_LUT_SIZE];
+static uint16_t tx_buf[2][SPB];          /* doble buffer (ping-pong)            */
+static volatile uint8_t  tx_active_buf;  /* buffer que el DMA esta leyendo      */
+static volatile uint32_t tx_phase;       /* acumulador de fase DDS (continuo)   */
+
+static volatile uint8_t  tx_busy = false;
+static volatile uint8_t  tx_frame[11];   /* 8O1: start,8 datos,paridad,stop     */
+static volatile int8_t   tx_idx;         /* bit actual de la trama; -1 = mark   */
+
+/* --- RX --- */
+static uint16_t rx_ring[RX_RING_LEN];
+static uint16_t rx_rd;
 
 /*******************************************************************************
- * PROTOTIPOS LOCALES
+ * UTILIDADES
  ******************************************************************************/
-static void FSK_V1_GenerateLUTs(void);
-static void PIT_Baudrate_Init(void);
+static void build_sine_lut(void)
+{
+    for (uint16_t i = 0; i < SINE_LUT_SIZE; i++) {
+        float a = (2.0f * (float)M_PI * (float)i) / (float)SINE_LUT_SIZE;
+        sine_lut[i] = (int16_t)(DAC_CENTER + (int)(DAC_AMPL * sinf(a)));
+    }
+}
+
+/* Genera SPB muestras del 'bit' indicado en buf[], avanzando la fase global. */
+static void render_bit(uint16_t *buf, uint8_t bit)
+{
+    uint32_t inc = (bit) ? PHASE_INC_MARK : PHASE_INC_SPACE;  /* 1=mark, 0=space */
+    uint32_t ph  = tx_phase;
+    for (uint16_t i = 0; i < SPB; i++) {
+        buf[i] = (uint16_t)sine_lut[ph >> 24];   /* top 8 bits -> indice LUT */
+        ph += inc;
+    }
+    tx_phase = ph;                                /* fase continua entre bits */
+}
+
+/* Devuelve el proximo bit a transmitir: de la trama si hay, si no MARK(1). */
+static uint8_t next_tx_bit(void)
+{
+    if (tx_idx >= 0 && tx_idx < 11) {
+        uint8_t b = tx_frame[tx_idx++];
+        if (tx_idx >= 11) { tx_idx = -1; tx_busy = false; }
+        return b;
+    }
+    return 1; /* reposo: mark continuo */
+}
 
 /*******************************************************************************
- * IMPLEMENTACIÓN DE LA INTERFAZ PÚBLICA V1
+ * FTM0 como base de tiempos del DMA de TX (free-run, DMA por match de canal 0)
  ******************************************************************************/
+static void FTM0_DacClock_Init(void)
+{
+    SIM->SCGC6 |= SIM_SCGC6_FTM0_MASK;
 
+    FTM0->SC = 0;
+    FTM0->CNTIN = 0;
+    FTM0->CNT = 0;
+    FTM0->MOD = (uint16_t)(FTM0_CLOCK_HZ / FS_HZ) - 1;   /* periodo = 1/Fs */
+
+    /* Canal 0 output-compare; peticion de DMA en cada match (MSA + DMA + CHIE). */
+    FTM0->CONTROLS[0].CnV  = 0;
+    FTM0->CONTROLS[0].CnSC = FTM_CnSC_MSA_MASK | FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK;
+
+    FTM0->SC = FTM_SC_CLKS(1) | FTM_SC_PS(0);            /* system clock, /1 */
+}
+
+/*******************************************************************************
+ * INTERFAZ PUBLICA
+ ******************************************************************************/
 void FSK_V1_Init(fsk_v1_rx_callback_t rx_cb)
 {
     rx_callback = rx_cb;
     tx_busy = false;
-    current_bit_idx = -1;
+    tx_idx  = -1;
+    tx_phase = 0;
+    tx_active_buf = 0;
 
-    // 1. Calcular de forma estática las formas de onda en memoria
-    FSK_V1_GenerateLUTs();
+    build_sine_lut();
 
-    // 2. Inicializar los periféricos de MCAL
     DAC_Init();
     DMA_Init();
-    PIT_Baudrate_Init();
+
+    /* ---- TX: precargar ambos buffers con MARK (reposo) y arrancar stream ---- */
+    render_bit(tx_buf[0], 1);
+    render_bit(tx_buf[1], 1);
+    DMA_Configure_TxToDAC(DMA_CH_DAC0, DMAMUX_SRC_FTM0_CH0,
+                          (uint32_t)tx_buf[0], (uint32_t)&DAC0->DAT[0], SPB);
+    NVIC_EnableIRQ(DMA0_IRQn);
+    DMA_EnableRequest(DMA_CH_DAC0);
+    FTM0_DacClock_Init();
+
+    /* ---- RX: ADC0 disparado por PIT0 + eDMA a ring circular ---- */
     ADC_Init();
+    ADC_ConfigRxHwTriggerDMA(ADC_CH_A0);
+    DMA_Configure_RxFromADC(DMA_CH_ADC0, DMAMUX_SRC_ADC0,
+                            (uint32_t)&ADC0->R[0], (uint32_t)rx_ring, RX_RING_LEN);
+    DMA_EnableRequest(DMA_CH_ADC0);
+
+    rx_rd = 0;
+    fsk_demod_init((fsk_demod_byte_cb_t)rx_callback);
+
+    /* PIT0 = reloj de muestreo del ADC (trigger HW a Fs, sin IRQ de CPU). */
+    SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
+    PIT->MCR = PIT_MCR_FRZ_MASK;
+    PIT_ConfigureTrigger(PIT_CH0, (PIT_CLOCK_HZ / FS_HZ) - 1);  /* 50e6/24000-1 */
 }
 
 bool FSK_V1_TransmitByte(uint8_t data)
@@ -74,38 +179,18 @@ bool FSK_V1_TransmitByte(uint8_t data)
         return false;
     }
 
-    tx_busy = true;
-
-    // Armar la trama estándar UART de 11 bits (Start, 8 bits, Paridad Impar, Stop)
-    tx_bit_buffer[0] = 0; // Start bit (Space = 2200 Hz)
-
     uint8_t parity_count = 0;
+    tx_frame[0] = 0;                         /* start = space (0) */
     for (uint8_t i = 0; i < 8; i++) {
-        uint8_t bit = (data >> i) & 0x01;
-        tx_bit_buffer[i + 1] = bit;
+        uint8_t bit = (data >> i) & 0x01;    /* LSB primero */
+        tx_frame[i + 1] = bit;
         if (bit) parity_count++;
     }
+    tx_frame[9]  = (parity_count % 2 == 0) ? 1 : 0;  /* paridad IMPAR */
+    tx_frame[10] = 1;                                /* stop = mark (1) */
 
-    tx_bit_buffer[9] = (parity_count % 2 == 0) ? 1 : 0; // Paridad impar
-    tx_bit_buffer[10] = 1; // Stop bit (Mark = 1200 Hz)
-
-    // Comenzar apuntando al bit 0 (Start)
-    current_bit_idx = 0;
-
-    // Forzar el primer disparo del DMA con el buffer del bit de Space (2200Hz)
-    DMA_Configure_MemToPeripheral16(
-        DMA_CH_DAC0,
-        DMAMUX_SOURCE_DAC0,
-        (uint32_t)lut_space_bit,
-        (uint32_t)&(DAC0->DAT[0]),
-        SAMPLES_PER_BIT_SPACE
-    );
-
-    DMA_EnableRequest(DMA_CH_DAC0);
-
-    // Arrancar el PIT para que cuente 833us (tiempo de un bit completo)
-    PIT->CHANNEL[0].TCTRL |= PIT_TCTRL_TEN_MASK;
-
+    tx_idx  = 0;
+    tx_busy = true;          /* la ISR del DMA tomara la trama bit a bit */
     return true;
 }
 
@@ -116,87 +201,29 @@ bool FSK_V1_IsTransmitBusy(void)
 
 void FSK_V1_PeriodicTask(void)
 {
-    // Reservado para procesamiento de bloques del ADC (Recepción)
+    /* Consumir muestras nuevas del ring de RX y pasarlas por la DSP. */
+    uint16_t wr = DMA_RxWriteIndex(DMA_CH_ADC0, (uint32_t)rx_ring, RX_RING_LEN);
+    while (rx_rd != wr) {
+        fsk_demod_process_sample(rx_ring[rx_rd]);
+        rx_rd = (uint16_t)((rx_rd + 1U) % RX_RING_LEN);
+        wr = DMA_RxWriteIndex(DMA_CH_ADC0, (uint32_t)rx_ring, RX_RING_LEN);
+    }
 }
 
 /*******************************************************************************
- * GENERACIÓN DE SEÑAL ANALÓGICA & INFRAESTRUCTURA
+ * ISR del eDMA canal 0 (fin de major loop == fin de un bit de TX).
  ******************************************************************************/
-
-/**
- * @brief Pre-calcula un bit completo de Mark y Space centrados a 1.65V (12 bits)
- */
-static void FSK_V1_GenerateLUTs(void)
+#ifdef USE_VERSION_1
+void DMA0_IRQHandler(void)
 {
-    // Llenar tabla de Mark (1200 Hz -> 18 muestras)
-    for (uint16_t i = 0; i < SAMPLES_PER_BIT_MARK; i++) {
-        float angle = (2.0f * PI * (float)i) / (float)SAMPLES_PER_BIT_MARK;
-        lut_mark_bit[i] = (uint16_t)((sinf(angle) * 2047.0f) + 2048.0f);
-    }
+    DMA0->CINT = DMA_CH_DAC0;                 /* limpiar flag de interrupcion */
 
-    // Llenar tabla de Space (2200 Hz -> 10 muestras)
-    for (uint16_t i = 0; i < SAMPLES_PER_BIT_SPACE; i++) {
-        float angle = (2.0f * PI * (float)i) / (float)SAMPLES_PER_BIT_SPACE;
-        lut_space_bit[i] = (uint16_t)((sinf(angle) * 2047.0f) + 2048.0f);
-    }
+    uint8_t just_done = tx_active_buf;
+    uint8_t next      = (uint8_t)(just_done ^ 1u);
+
+    DMA0->TCD[DMA_CH_DAC0].SADDR = (uint32_t)tx_buf[next];  /* poner a leer el listo */
+    tx_active_buf = next;
+
+    render_bit(tx_buf[just_done], next_tx_bit());           /* rellenar el otro */
 }
-
-static void PIT_Baudrate_Init(void)
-{
-    SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
-    PIT->MCR = 0x00;
-
-    // Configurar PIT Canal 0 para interrumpir a la tasa de bits (1200 Hz -> 833 us)
-    // 50 MHz / 1200 Hz = 41666 ticks
-    PIT->CHANNEL[0].LDVAL = (50000000U / BAUDRATE) - 1;
-    PIT->CHANNEL[0].TCTRL = PIT_TCTRL_TIE_MASK; // Habilitar ISR pero arranca apagado (TEN=0)
-
-    NVIC_EnableIRQ(PIT0_IRQn);
-}
-
-/**
- * @brief ISR del PIT0 - Se ejecuta SOLO al final de cada bit (Cada 833 us)
- */
-void PIT0_IRQHandler(void)
-{
-    PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
-
-    if (tx_busy) {
-        current_bit_idx++;
-
-        if (current_bit_idx < 11) {
-            // Determinar el próximo bit a transmitir de la trama
-            uint8_t next_bit = tx_bit_buffer[current_bit_idx];
-
-            // Apagar momentáneamente el requerimiento para reconfigurar el puntero de RAM
-            DMA_DisableRequest(DMA_CH_DAC0);
-
-            if (next_bit == 1) {
-                // Modificar el TCD del DMA al vuelo para que apunte a las muestras de Mark
-                DMA0->TCD[DMA_CH_DAC0].SADDR = (uint32_t)lut_mark_bit;
-                DMA0->TCD[DMA_CH_DAC0].CITER_ELINKNO = SAMPLES_PER_BIT_MARK;
-                DMA0->TCD[DMA_CH_DAC0].BITER_ELINKNO = SAMPLES_PER_BIT_MARK;
-                DMA0->TCD[DMA_CH_DAC0].SLAST = -(SAMPLES_PER_BIT_MARK * 2);
-            } else {
-                // Modificar el TCD del DMA al vuelo para que apunte a las muestras de Space
-                DMA0->TCD[DMA_CH_DAC0].SADDR = (uint32_t)lut_space_bit;
-                DMA0->TCD[DMA_CH_DAC0].CITER_ELINKNO = SAMPLES_PER_BIT_SPACE;
-                DMA0->TCD[DMA_CH_DAC0].BITER_ELINKNO = SAMPLES_PER_BIT_SPACE;
-                DMA0->TCD[DMA_CH_DAC0].SLAST = -(SAMPLES_PER_BIT_SPACE * 2);
-            }
-
-            // Volver a encender el canal
-            DMA_EnableRequest(DMA_CH_DAC0);
-        } else {
-            // Se transmitieron los 11 bits, apagar transmisión
-            DMA_DisableRequest(DMA_CH_DAC0);
-            PIT->CHANNEL[0].TCTRL &= ~PIT_TCTRL_TEN_MASK; // Apagar Timer
-            current_bit_idx = -1;
-            tx_busy = false;
-
-            // Dejar el DAC fijo en tensión media (IDLE)
-            DAC_SetData(DAC_0, 2048);
-        }
-    }
-}
-
+#endif

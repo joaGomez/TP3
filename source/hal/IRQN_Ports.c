@@ -63,9 +63,10 @@ void init_nvic(uint8_t port) {
 		NVIC_EnableIRQ(PORTD_IRQn);
 		break;
 	case PE:
-		NVIC_ClearPendingIRQ(PORTD_IRQn);
-		NVIC_SetPriority(PORTD_IRQn, 5);
-		NVIC_EnableIRQ(PORTD_IRQn);
+		/* [FIX] antes referenciaba PORTD_IRQn (copy-paste); debe ser PORTE_IRQn */
+		NVIC_ClearPendingIRQ(PORTE_IRQn);
+		NVIC_SetPriority(PORTE_IRQn, 5);
+		NVIC_EnableIRQ(PORTE_IRQn);
 		break;
 	}
 
