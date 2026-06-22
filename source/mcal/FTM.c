@@ -1,210 +1,145 @@
+/***************************************************************************//**
+  @file     FTM.c
+  @brief    Implementación del Driver FlexTimer (FTM) para K64F
+ ******************************************************************************/
 
 #include "FTM.h"
-#include "PORT.h"
-#include "GPIO.h"
-#include "FTM.h"
+#include "MK64F12.h"  // Archivo de registro del microcontrolador K64F
 
-///////////////#include "PWM.h"
+/*******************************************************************************
+ * CONFIGURACIONES INTERNAS Y CONSTANTES
+ ******************************************************************************/
 
-void OVF_Init(void);
-void OVF_ISR(void);
+#define FTM_CLOCK_HZ        50000000U // Frecuencia del reloj del bus (50 MHz)
+#define FTM_PRESCALER_DIV   1         // Divisor del prescaler (PS = 0 -> /1)
 
-/* FTM0 fault, overflow and channels interrupt handler*/
+/* Cálculos de MOD para generar las frecuencias deseadas mediante Toggle (Output Compare)
+ * Nota: En modo Output Compare con Toggle, la señal cambia de estado cada vez que el contador
+ * alcanza el valor de MOD. Por ende, el período total de la señal es 2 * MOD.
+ * Frecuencia_onda = FTM_CLOCK / (2 * MOD)  =>  MOD = FTM_CLOCK / (2 * Frecuencia_onda)
+ */
+#define MOD_VAL_1200HZ   ((FTM_CLOCK_HZ / (2 * FSK_FREQ_MARK * FTM_PRESCALER_DIV)) - 1)
+#define MOD_VAL_2200HZ   ((FTM_CLOCK_HZ / (2 * FSK_FREQ_SPACE * FTM_PRESCALER_DIV)) - 1)
 
-__ISR__ FTM0_IRQHandler(void)
+// Punteros globales para almacenar los callbacks de interrupción
+static ftm_callback_t tx_callback = 0;
+static ftm_callback_t rx_callback = 0;
+
+
+/*******************************************************************************
+ * IMPLEMENTACIÓN DE FUNCIONES
+ ******************************************************************************/
+
+void FTM_TX_Init(ftm_module_t module, ftm_channel_t channel, ftm_callback_t callback)
 {
-	OVF_ISR();
-}
+	FTM_Type *ftm = FTM0;
+	tx_callback = callback;
 
-void OVF_ISR(void)
-{
-
-	FTM_ClearOverflowFlag (FTM0);
-	GPIO_Toggle(PTC, 1 << 8);
-
-}
-
-void FTM_Init (void)
-{
+	/* 1. Habilitar el Clock Gating para FTM0 */
 	SIM->SCGC6 |= SIM_SCGC6_FTM0_MASK;
-	SIM->SCGC6 |= SIM_SCGC6_FTM1_MASK;
-	SIM->SCGC6 |= SIM_SCGC6_FTM2_MASK;
-	SIM->SCGC3 |= SIM_SCGC3_FTM2_MASK;
-	SIM->SCGC3 |= SIM_SCGC3_FTM3_MASK;
+    /* 2. Configuración inicial del FTM */
+    ftm->MODE |= FTM_MODE_WPDIS_MASK; // Deshabilitar protección contra escritura para configurar
+    ftm->CNTIN = 0;                   // El contador arranca en cero
 
-	NVIC_EnableIRQ(FTM0_IRQn);
-	NVIC_EnableIRQ(FTM1_IRQn);
-	NVIC_EnableIRQ(FTM2_IRQn);
-	NVIC_EnableIRQ(FTM3_IRQn);
+    /* 3. Configurar para que arranque en un estado inicial (Mark - 1200 Hz) */
+    ftm->MOD = MOD_VAL_1200HZ;
 
-	FTM0->PWMLOAD = FTM_PWMLOAD_LDOK_MASK | 0x0F;
-	FTM1->PWMLOAD = FTM_PWMLOAD_LDOK_MASK | 0x0F;
-	FTM2->PWMLOAD = FTM_PWMLOAD_LDOK_MASK | 0x0F;
-	FTM3->PWMLOAD = FTM_PWMLOAD_LDOK_MASK | 0x0F;
+    /* 4. Configurar el Canal en modo Output Compare - Toggle on Match */
+    // MSnB:MSnA = 0:1 , ELSnB:ELSnA = 0:1  --> Output Compare, Toggle output en match
+    ftm->CONTROLS[channel].CnSC = FTM_CnSC_MSA_MASK | FTM_CnSC_ELSA_MASK;
 
-	/*
-	 * TO DO
-	 */
+    /* 5. Habilitar la interrupción por desborde del Timer (TOF) para sincronismo de bits */
+    ftm->SC = FTM_SC_TOIE_MASK | FTM_SC_PS(0); // Prescaler = 1 (PS=0)
 
-	OVF_Init();
+    /* 6. Seleccionar Clock Source para encender el contador (System Clock) */
+    ftm->SC |= FTM_SC_CLKS(1);
+
+    /* 7. Habilitar interrupciones en el NVIC */
+    if(module == FTM_MODULE_0)      NVIC_EnableIRQ(FTM0_IRQn);
+    else if(module == FTM_MODULE_3) NVIC_EnableIRQ(FTM3_IRQn);
 }
 
-
-/// FTM overflow interrupt example
-
-
-
-void OVF_Init (void)
+void FTM_TX_SetFrequency(ftm_module_t module, uint32_t frequency)
 {
-	PCRstr UserPCR;
+    FTM_Type *ftm = FTM0;
 
-	//Set up pin 8 of PORTC as output for debug Overflow interrupt
-
-	UserPCR.PCR=false;			// Default All false, Set only those needed
-
-	UserPCR.FIELD.DSE=true;
-	UserPCR.FIELD.MUX=PORT_mGPIO;
-	UserPCR.FIELD.IRQC=PORT_eDisabled;
-	PORT_Configure2 (PORTC,8,UserPCR);
-
-	GPIO_SetDirection(PTC, 8, GPIO__OUT);
-
-//  Set up timer for Overflow interrupt
-
-//  Enable Timer advanced modes (FTMEN=1)
-
-
-	FTM0->MODE=(FTM0->MODE & ~FTM_MODE_FTMEN_MASK) | FTM_MODE_FTMEN(1);
-
- /// Reminder:BusClock=sysclk/2= 50MHz
-
-/// Set prescaler = divx4 => timer clock = 4 x (1/BusClock)= 4x1/50MHz= 80 nseg
-	FTM_SetPrescaler(FTM0, FTM_PSC_x4);
-
- /// Set Overflow period = (MOD-CNTIN+1) x 4 x (1/BusClock)= 50x4*1/50MHz= 4us
-	FTM0->CNTIN=0x00;
-	FTM0->MOD=50-1;
-
- ///Enable Timer Overflow interrupt
-	FTM0->SC = (FTM0->SC & ~FTM_SC_TOIE_MASK) | FTM_SC_TOIE(1);
-
-FTM_StartClock(FTM0);			      //  Clock select
-
-
+    // Al escribir sobre MOD, gracias al buffering nativo del FTM,
+    // el cambio se efectivizará en el próximo desborde garantizando fase continua.
+    if (frequency == FSK_FREQ_MARK) {
+        ftm->MOD = MOD_VAL_1200HZ;
+    } else if (frequency == FSK_FREQ_SPACE) {
+        ftm->MOD = MOD_VAL_2200HZ;
+    }
 }
 
-
-
-// Setters
-
-void FTM_SetPrescaler (FTM_t ftm, FTM_Prescal_t data)
+void FTM_RX_Init(ftm_module_t module, ftm_channel_t channel, ftm_callback_t callback)
 {
-	ftm->SC = (ftm->SC & ~FTM_SC_PS_MASK) | FTM_SC_PS(data);
+    FTM_Type *ftm = FTM0;
+    rx_callback = callback;
+
+    /* 1. Habilitar Clock Gating */
+    if(module == FTM_MODULE_1)      SIM->SCGC6 |= SIM_SCGC6_FTM1_MASK;
+    else if(module == FTM_MODULE_2) SIM->SCGC6 |= SIM_SCGC6_FTM2_MASK;
+
+    ftm->MODE |= FTM_MODE_WPDIS_MASK; // Deshabilitar protección contra escritura
+    ftm->CNTIN = 0;
+    ftm->MOD = 0xFFFF;                // Dejar que cuente libremente hasta el máximo (Free Running)
+
+    /* 2. Configurar Canal en modo Input Capture */
+    // MSnB:MSnA = 0:0, ELSnB:ELSnA = 0:1 (Captura en flanco ascendente) u 1:1 (Cualquier flanco)
+    // Para medir semiciclos o ciclos enteros elegimos capturar en cualquier flanco (Either Edge)
+    ftm->CONTROLS[channel].CnSC = FTM_CnSC_ELSA_MASK | FTM_CnSC_ELSB_MASK | FTM_CnSC_CHIE_MASK;
+
+    /* 3. Encender el contador (System clock, Prescaler /1) */
+    ftm->SC = FTM_SC_CLKS(1) | FTM_SC_PS(0);
+
+    /* 4. Ruteo interno: Conectar la salida del CMP al canal FTM (Esto se hace vía SIM_SOPT4) */
+    // Por ejemplo, si usamos FTM1 Canal 0, mapear la salida de CMP0 a FTM1_CH0
+    if (module == FTM_MODULE_1 && channel == FTM_CHANNEL_0) {
+        SIM->SOPT4 |= SIM_SOPT4_FTM1CH0SRC(1); // 1 selecciona la salida del comparador analógico (CMP0)
+    }
+
+    /* 5. Habilitar interrupciones en el NVIC */
+    if(module == FTM_MODULE_1)      NVIC_EnableIRQ(FTM1_IRQn);
+    else if(module == FTM_MODULE_2) NVIC_EnableIRQ(FTM2_IRQn);
 }
 
-void FTM_SetModulus (FTM_t ftm, FTMData_t data)
+uint16_t FTM_RX_GetCaptureValue(ftm_module_t module, ftm_channel_t channel)
 {
-	ftm->CNTIN = 0X00;
-	ftm->CNT = 0X00;
-	ftm->MOD = FTM_MOD_MOD(data);
+    return (uint16_t)(FTM0->CONTROLS[channel].CnV);
 }
 
-FTMData_t FTM_GetModulus (FTM_t ftm)
+void FTM_ClearInterruptFlag(ftm_module_t module, ftm_channel_t channel)
 {
-	return ftm->MOD & FTM_MOD_MOD_MASK;
+    // Para borrar la bandera de canal CHF hay que leer CnSC y escribir un 0 en el bit CHF
+    FTM0->CONTROLS[channel].CnSC &= ~FTM_CnSC_CHF_MASK;
 }
 
-void FTM_StartClock (FTM_t ftm)
+/*******************************************************************************
+ * INTERRUPCIONES (ISRs)
+ ******************************************************************************/
+
+// ISR para FTM0 (Asumido TX en este ejemplo)
+void FTM0_IRQHandler(void)
 {
-	ftm->SC |= FTM_SC_CLKS(0x01);
+    // Si fue por desborde de Timer (TOF)
+    if (FTM0->SC & FTM_SC_TOF_MASK) {
+        FTM0->SC &= ~FTM_SC_TOF_MASK; // Limpiar bandera TOF
+        if (tx_callback) {
+            tx_callback(); // Invoca la lógica de la capa HAL para cambiar bits si corresponde
+        }
+    }
 }
 
-void FTM_StopClock (FTM_t ftm)
+// ISR para FTM1 (Asumido RX en este ejemplo)
+void FTM1_IRQHandler(void)
 {
-	ftm->SC &= ~FTM_SC_CLKS(0x01);
+    // Verificamos si la interrupción fue generada por el canal 0 (Input Capture)
+    if (FTM1->CONTROLS[FTM_CHANNEL_0].CnSC & FTM_CnSC_CHF_MASK) {
+        if (rx_callback) {
+            rx_callback(); // Invoca la lógica de demodulación
+        }
+        // Limpiamos la bandera del canal
+        FTM1->CONTROLS[FTM_CHANNEL_0].CnSC &= ~FTM_CnSC_CHF_MASK;
+    }
 }
-
-void FTM_SetOverflowMode (FTM_t ftm, bool mode)
-{
-	ftm->SC = (ftm->SC & ~FTM_SC_TOIE_MASK) | FTM_SC_TOIE(mode);
-}
-
-bool FTM_IsOverflowPending (FTM_t ftm)
-{
-	return ftm->SC & FTM_SC_TOF_MASK;
-}
-
-void FTM_ClearOverflowFlag (FTM_t ftm)
-{
-	ftm->SC &= ~FTM_SC_TOF_MASK;
-}
-
-void FTM_SetWorkingMode (FTM_t ftm, FTMChannel_t channel, FTMMode_t mode)
-{
-	ftm->CONTROLS[channel].CnSC = (ftm->CONTROLS[channel].CnSC & ~(FTM_CnSC_MSB_MASK | FTM_CnSC_MSA_MASK)) |
-			                      (FTM_CnSC_MSB((mode >> 1) & 0X01) | FTM_CnSC_MSA((mode >> 0) & 0X01));
-}
-
-FTMMode_t FTM_GetWorkingMode (FTM_t ftm, FTMChannel_t channel)
-{
-	return (ftm->CONTROLS[channel].CnSC & (FTM_CnSC_MSB_MASK | FTM_CnSC_MSA_MASK)) >> FTM_CnSC_MSA_SHIFT;
-}
-
-void FTM_SetInputCaptureEdge (FTM_t ftm, FTMChannel_t channel, FTMEdge_t edge)
-{
-	ftm->CONTROLS[channel].CnSC = (ftm->CONTROLS[channel].CnSC & ~(FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) |
-				                  (FTM_CnSC_ELSB((edge >> 1) & 0X01) | FTM_CnSC_ELSA((edge >> 0) & 0X01));
-}
-
-FTMEdge_t FTM_GetInputCaptureEdge (FTM_t ftm, FTMChannel_t channel)
-{
-	return (ftm->CONTROLS[channel].CnSC & (FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) >> FTM_CnSC_ELSA_SHIFT;
-}
-
-void FTM_SetOutputCompareEffect (FTM_t ftm, FTMChannel_t channel, FTMEffect_t effect)
-{
-	ftm->CONTROLS[channel].CnSC = (ftm->CONTROLS[channel].CnSC & ~(FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) |
-				                  (FTM_CnSC_ELSB((effect >> 1) & 0X01) | FTM_CnSC_ELSA((effect >> 0) & 0X01));
-}
-
-FTMEffect_t FTM_GetOutputCompareEffect (FTM_t ftm, FTMChannel_t channel)
-{
-	return (ftm->CONTROLS[channel].CnSC & (FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) >> FTM_CnSC_ELSA_SHIFT;
-}
-
-void FTM_SetPulseWidthModulationLogic (FTM_t ftm, FTMChannel_t channel, FTMLogic_t logic)
-{
-	ftm->CONTROLS[channel].CnSC = (ftm->CONTROLS[channel].CnSC & ~(FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) |
-				                  (FTM_CnSC_ELSB((logic >> 1) & 0X01) | FTM_CnSC_ELSA((logic >> 0) & 0X01));
-}
-
-FTMLogic_t FTM_GetPulseWidthModulationLogic (FTM_t ftm, FTMChannel_t channel)
-{
-	return (ftm->CONTROLS[channel].CnSC & (FTM_CnSC_ELSB_MASK | FTM_CnSC_ELSA_MASK)) >> FTM_CnSC_ELSA_SHIFT;
-}
-
-void FTM_SetCounter (FTM_t ftm, FTMChannel_t channel, FTMData_t data)
-{
-	ftm->CONTROLS[channel].CnV = FTM_CnV_VAL(data);
-}
-
-FTMData_t FTM_GetCounter (FTM_t ftm, FTMChannel_t channel)
-{
-	return ftm->CONTROLS[channel].CnV & FTM_CnV_VAL_MASK;
-}
-
-void FTM_SetInterruptMode (FTM_t ftm, FTMChannel_t channel, bool mode)
-{
-	ftm->CONTROLS[channel].CnSC = (ftm->CONTROLS[channel].CnSC & ~FTM_CnSC_CHIE_MASK) | FTM_CnSC_CHIE(mode);
-}
-
-bool FTM_IsInterruptPending (FTM_t ftm, FTMChannel_t channel)
-{
-	return ftm->CONTROLS[channel].CnSC & FTM_CnSC_CHF_MASK;
-}
-
-void FTM_ClearInterruptFlag (FTM_t ftm, FTMChannel_t channel)
-{
-	ftm->CONTROLS[channel].CnSC &= ~FTM_CnSC_CHF_MASK;
-}
-

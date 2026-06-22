@@ -1,102 +1,83 @@
+/***************************************************************************//**
+  @file     FTM.h
+  @brief    Driver para el periférico FlexTimer (FTM) - K64F
+ ******************************************************************************/
 
-#ifndef SOURCES_FTM_H_
-#define SOURCES_FTM_H_
+#ifndef MCAL_FTM_H_
+#define MCAL_FTM_H_
 
-#include "hardware.h"
+#include <stdint.h>
+#include <stdbool.h>
 
-typedef enum
-{
-	FTM_mInputCapture,
-	FTM_mOutputCompare,
-	FTM_mPulseWidthModulation,
-} FTMMode_t;
+/*******************************************************************************
+ * ENUMERACIONES Y DEFINICIONES
+ ******************************************************************************/
 
-typedef enum
-{
-	FTM_eRising 		= 0x01,
-	FTM_eFalling 		= 0x02,
-	FTM_eEither 		= 0x03,
-} FTMEdge_t;
+typedef enum {
+    FTM_MODULE_0 = 0,
+    FTM_MODULE_1,
+    FTM_MODULE_2,
+    FTM_MODULE_3
+} ftm_module_t;
 
-typedef enum
-{
-	FTM_eToggle 		= 0x01,
-	FTM_eClear 			= 0x02,
-	FTM_eSet 			= 0x03,
-} FTMEffect_t;
+typedef enum {
+    FTM_CHANNEL_0 = 0,
+    FTM_CHANNEL_1,
+    FTM_CHANNEL_2,
+    FTM_CHANNEL_3,
+    FTM_CHANNEL_4,
+    FTM_CHANNEL_5,
+    FTM_CHANNEL_6,
+    FTM_CHANNEL_7
+} ftm_channel_t;
 
-typedef enum
-{
-	FTM_lAssertedHigh	= 0x02,
-	FTM_lAssertedLow 	= 0x03,
-} FTMLogic_t;
+/* Frecuencias requeridas para Bell 202 */
+#define FSK_FREQ_MARK   1200  // Hz (Bit '1')
+#define FSK_FREQ_SPACE  2200  // Hz (Bit '0')
 
-typedef enum
-{
-	FTM_PSC_x1		= 0x00,
-	FTM_PSC_x2		= 0x01,
-	FTM_PSC_x4		= 0x02,
-	FTM_PSC_x8		= 0x03,
-	FTM_PSC_x16		= 0x04,
-	FTM_PSC_x32		= 0x05,
-	FTM_PSC_x64		= 0x06,
-	FTM_PSC_x128	= 0x07,
+/* Tipo de callback para las interrupciones del FTM */
+typedef void (*ftm_callback_t)(void);
 
-} FTM_Prescal_t;
+/*******************************************************************************
+ * FUNCIONES DE CONFIGURACIÓN Y CONTROL
+ ******************************************************************************/
 
+/**
+ * @brief Inicializa un módulo FTM en modo Output Compare / PWM para Transmisión (TX)
+ * @param module Módulo FTM a utilizar (ej: FTM0 o FTM3)
+ * @param channel Canal FTM asociado al pin de salida
+ * @param callback Función que se llamará en cada desborde/interrupción de canal (para cambiar de estado)
+ */
+void FTM_TX_Init(ftm_module_t module, ftm_channel_t channel, ftm_callback_t callback);
 
+/**
+ * @brief Modifica dinámicamente la frecuencia de salida manteniendo la fase continua
+ * @param module Módulo FTM de TX
+ * @param frequency Frecuencia deseada (FSK_FREQ_MARK o FSK_FREQ_SPACE)
+ */
+void FTM_TX_SetFrequency(ftm_module_t module, uint32_t frequency);
 
+/**
+ * @brief Inicializa un módulo FTM en modo Input Capture para Recepción (RX)
+ * @param module Módulo FTM a utilizar (ej: FTM1 o FTM2)
+ * @param channel Canal FTM mapeado a la salida del CMP (usando SIM_SOPT4)
+ * @param callback Función que se llamará al capturar un flanco
+ */
+void FTM_RX_Init(ftm_module_t module, ftm_channel_t channel, ftm_callback_t callback);
 
-#define FTM_CH_0 0
-#define FTM_CH_1 1
-#define FTM_CH_2 2
-#define FTM_CH_3 3
-#define FTM_CH_4 4
-#define FTM_CH_5 5
-#define FTM_CH_6 6
-#define FTM_CH_7 7
+/**
+ * @brief Lee el valor capturado en el registro del canal (para cálculo de períodos)
+ * @param module Módulo FTM de RX
+ * @param channel Canal FTM de RX
+ * @return Valor del contador capturado en el flanco (16 bits)
+ */
+uint16_t FTM_RX_GetCaptureValue(ftm_module_t module, ftm_channel_t channel);
 
+/**
+ * @brief Limpia la bandera de interrupción del canal
+ * @param module Módulo FTM
+ * @param channel Canal FTM
+ */
+void FTM_ClearInterruptFlag(ftm_module_t module, ftm_channel_t channel);
 
-
-
-
-
-typedef FTM_Type *FTM_t;
-typedef uint16_t FTMData_t;
-typedef uint32_t FTMChannel_t; /* FTM0/FTM3: Channel 1-8; FTM1/FTM2: Channel 1-2 */
-
-//__ISR__ 	FTM0_IRQHandler					 (void);
-//__ISR__ 	FTM1_IRQHandler					 (void);
-//__ISR__ 	FTM2_IRQHandler					 (void);
-//__ISR__ 	FTM3_IRQHandler					 (void);
-
-void 		FTM_Init 						 (void);
-
-void        FTM_SetPrescaler 				 (FTM_t, FTM_Prescal_t);
-void     	FTM_SetModulus 					 (FTM_t, FTMData_t);
-FTMData_t 	FTM_GetModulus 					 (FTM_t);
-
-void 		FTM_StartClock					 (FTM_t);
-void 		FTM_StopClock					 (FTM_t);
-
-void 		FTM_SetOverflowMode   			 (FTM_t, bool);
-bool 		FTM_IsOverflowPending 			 (FTM_t);
-void 		FTM_ClearOverflowFlag 			 (FTM_t);
-
-void        FTM_SetWorkingMode				 (FTM_t, FTMChannel_t, FTMMode_t);
-FTMMode_t   FTM_GetWorkingMode				 (FTM_t, FTMChannel_t);
-void        FTM_SetInputCaptureEdge 		 (FTM_t, FTMChannel_t, FTMEdge_t);
-FTMEdge_t   FTM_GetInputCaptureEdge 		 (FTM_t, FTMChannel_t);
-void        FTM_SetOutputCompareEffect 	 	 (FTM_t, FTMChannel_t, FTMEffect_t);
-FTMEffect_t FTM_GetOutputCompareEffect 		 (FTM_t, FTMChannel_t);
-void        FTM_SetPulseWidthModulationLogic (FTM_t, FTMChannel_t, FTMLogic_t);
-FTMLogic_t  FTM_GetPulseWidthModulationLogic (FTM_t, FTMChannel_t);
-
-void        FTM_SetCounter 					 (FTM_t, FTMChannel_t, FTMData_t);
-FTMData_t   FTM_GetCounter 					 (FTM_t, FTMChannel_t);
-
-void 		FTM_SetInterruptMode   			 (FTM_t, FTMChannel_t, bool);
-bool 		FTM_IsInterruptPending 			 (FTM_t, FTMChannel_t);
-void 		FTM_ClearInterruptFlag 			 (FTM_t, FTMChannel_t);
-
-#endif
+#endif /* MCAL_FTM_H_ */

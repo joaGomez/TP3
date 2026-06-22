@@ -1,311 +1,148 @@
-/***************************************************************************/ /**
-   @file     App.c
-   @brief    Application functions
-   @author   Nicolás Magliola
+/***************************************************************************//**
+  @file     App.c
+  @brief    Application functions - FSK Modem Bridge (Dual Version Configuration)
   ******************************************************************************/
 
 /*******************************************************************************
  * INCLUDE HEADER FILES
  ******************************************************************************/
-
-// FOR INIT
 #include "hal/board.h"
 #include "hal/leds.h"
 #include "hal/system.h"
 #include "hal/timers.h"
-#include "hal/accel.h"
-#include <string.h>
+#include "hal/FSK_V1.h"
+#include "hal/FSK_V2.h"
 #include "hal/USBComunications.h"
-#include "hal/CANComunications.h"
 #include "hardware.h"
+#include <string.h>
+
+// ============================================================================
+// CONFIGURACIÓN DE SELECCIÓN DE ENTREGA
+// ============================================================================
+#define USE_VERSION_2   // <-- Descomentar para compilar la V2 (PIT + CMP + FTM)
+// #define USE_VERSION_1   // <-- Descomentar para compilar la V1 (ADC + DAC + DMA)
 
 
 
-
-// #define DEBUG
 /*******************************************************************************
  * CONSTANT AND MACRO DEFINITIONS USING #DEFINE
  ******************************************************************************/
-
-#define MAXCHAR 5
-
-#define MIN_TIME_ELAPSED 50 // ms
-
-#define MAX_TIME_ELAPSED 2000 // ms
+// Cola o buffer circular simple de recepción para pasar los bytes decodificados
+#define RX_BUFFER_SIZE  128
 
 /*******************************************************************************
- * FUNCTION PROTOTYPES FOR PRIVATE FUNCTIONS WITH FILE LEVEL SCOPE
+ * VARIABLES LOCALES CON ALCANCE DE ARCHIVO
  ******************************************************************************/
-void int_to_ascii(int n, char *s);
-int ascii_to_int(char * s);
+static volatile uint8_t fsk_rx_fifo[RX_BUFFER_SIZE];
+static volatile uint16_t fsk_rx_head = 0;
+static volatile uint16_t fsk_rx_tail = 0;
+
 /*******************************************************************************
- *******************************************************************************
-                        GLOBAL FUNCTION DEFINITIONS
- *******************************************************************************
+ * PROTOTIPOS DE FUNCIONES PRIVADAS
  ******************************************************************************/
-AccelData_t   rawValues;   // Para X, Y, Z en g's
-AccelAngles_t angles;      // Para roll y pitch en grados
+static void App_FSK_Receive_Callback(uint8_t incoming_byte);
+static bool App_PushRxByte(uint8_t byte);
+static bool App_PopRxByte(uint8_t *byte);
 
-
-char val_ascii[MAXCHAR];        // Buffer para conversión numérica
-
-timer_t timerR_50ms = {.startMillis = 0, .started = false};
-timer_t timerR_2000ms = {.startMillis = 0, .started = false};
-timer_t timerC_50ms = {.startMillis = 0, .started = false};
-timer_t timerC_2000ms = {.startMillis = 0, .started = false};
-
-
-
-typedef struct 
-{
-	char pitch[MAXCHAR];
-	char roll[MAXCHAR];
-	char orientation[MAXCHAR];
-} position_t;
-
-position_t posGrupos[4] = {
-	{{'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}},
-	{{'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}},
-	{{'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}},
-	{{'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}, {'0','0','0','0', '\0'}}
-}; // Nombre de grupo - 1
+/*******************************************************************************
+ * CONFIGURACIÓN E INICIALIZACIÓN
+ ******************************************************************************/
 
 void App_Init(void) {
-	Accel_Init();
-	USBCom_Init();
-	initTimers();
-	initSystem(20);		// 20Hz == 50ms por cada interrupcion
-	CANCom_Init();
+    USBCom_Init();
+    initSystem(20);
 
-	if(ledsInit(RED)) {
-		return;
-	}
-	if(ledsInit(GREEN)) {
-		return;
-	}
-	if(ledsInit(BLUE)) {
-		return;
-	}
+    if(ledsInit(RED)) {
+    		return;
+    	}
+    	if(ledsInit(GREEN)) {
+    		return;
+    	}
+    	if(ledsInit(BLUE)) {
+    		return;
+    	}
 
-	ledOn(LEDOFF);
+    	ledOn(LEDOFF);
 
-	timerStart(&timerR_50ms);
-	timerStart(&timerR_2000ms);
-	timerStart(&timerC_50ms);
-	timerStart(&timerC_2000ms);
+#ifdef USE_VERSION_2
+    // ==========================================
+    // INICIALIZACIÓN - VERSÍON 2 (PIT + CMP + FTM)
+    // ==========================================
+    FSK_V2_Init(App_FSK_Receive_Callback);
+    ledOn(BLUE); // Azul indica que corre la V2 por hardware
+#else
+    // ==========================================
+    // INICIALIZACIÓN - VERSÍON 1 (ADC + DAC + DMA)
+    // ==========================================
+    FSK_V1_Init((fsk_v1_rx_callback_t)App_FSK_Receive_Callback);
+    ledOn(RED);  // Rojo indica que corre la V1 por streaming
+#endif
+
+    __enable_irq();
 }
-
 
 void App_Run(void) {
+    uint8_t pc_tx_byte;
+    uint8_t fsk_rx_byte;
 
-	if (Accel_StartCapture()) 
-	{
-		// Mientras esto ocurre, las interrupciones llenan el buffer en background
-		while (!Accel_IsDataReady()) 
-		{
-			uint8_t rx_led_byte;
-			if (USBCom_GetByte(&rx_led_byte)) {
-				// Validar estructura binaria (1JKL 0RGB)
-				if ((rx_led_byte & 0x80) && !(rx_led_byte & 0x08)) {
-					uint8_t target_group = (rx_led_byte >> 4) & 0x07;
-
-					if (target_group == 4) {
-						// Controlar hardware local
-						uint8_t r = (rx_led_byte >> 2) & 0x01;
-						uint8_t g = (rx_led_byte >> 1) & 0x01;
-						uint8_t b = rx_led_byte & 0x01;
-
-						uint8_t color_seteado = (r << 2) | (g << 1) | b;
-
-						ledOn(color_seteado);
-
-					}
-					else {
-						SendCAN(&rx_led_byte, 'L', 1);
-					}
-				}
-			}
-
-
-			if (CANReceived())
-			{
-				if (isMsgPosition())
-				{
-					char CANData[MAXCHAR];
-					uint8_t group;
-					char CANDataType;
-					group = (USBUpdate(CANData, &CANDataType)); // En posGrupos[G-1]
-					switch (CANDataType)
-					{
-						case 'R': // Roll
-							for (int i = 0; i < MAXCHAR; i++)
-							{
-								posGrupos[group].roll[i] = CANData[i];
-							}
-							break;
-						case 'C': // Pitch
-							for (int i = 0; i < MAXCHAR; i++)
-							{
-								posGrupos[group].pitch[i] = CANData[i];
-							}
-							break;
-						case 'O': // Orientación
-							for (int i = 0; i < MAXCHAR; i++)
-							{
-								posGrupos[group].orientation[i] = CANData[i];
-							}
-							break;
-						default:
-							break;
-					}
-					switch(group)
-					{
-						case 0:
-							USBCom_SendString(">S0,A0,V"); // Rolido: Estación 0, Ángulo 1
-							USBCom_SendString(posGrupos[0].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S0,A1,V"); // Pitch: Estación 0, Ángulo 0
-							USBCom_SendString(posGrupos[0].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						case 1:
-							USBCom_SendString(">S1,A0,V"); // Rolido: Estación 1, Ángulo 1
-							USBCom_SendString(posGrupos[1].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S1,A1,V"); // Pitch: Estación 1, Ángulo 0
-							USBCom_SendString(posGrupos[1].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						case 2:
-							USBCom_SendString(">S2,A0,V"); // Rolido: Estación 2, Ángulo 1
-							USBCom_SendString(posGrupos[2].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S2,A1,V"); // Pitch: Estación 2, Ángulo 0
-							USBCom_SendString(posGrupos[2].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						case 3:
-							USBCom_SendString(">S3,A0,V"); // Rolido: Estación 3, Ángulo 1
-							USBCom_SendString(posGrupos[3].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S3,A1,V"); // Pitch: Estación 3, Ángulo 0
-							USBCom_SendString(posGrupos[3].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						case 5:
-							USBCom_SendString(">S5,A0,V"); // Rolido: Estación 3, Ángulo 1
-							USBCom_SendString(posGrupos[5].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S5,A1,V"); // Pitch: Estación 3, Ángulo 0
-							USBCom_SendString(posGrupos[5].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						case 6:
-							USBCom_SendString(">S6,A0,V"); // Rolido: Estación 3, Ángulo 1
-							USBCom_SendString(posGrupos[6].roll);
-							USBCom_SendString("\n"); // Fin de trama
-							USBCom_SendString(">S6,A1,V"); // Pitch: Estación 3, Ángulo 0
-							USBCom_SendString(posGrupos[6].pitch);
-							USBCom_SendString("\n"); // Fin de trama
-							break;
-						default:
-							break;
-					}
-				}
-			}
-		}
-	}
-
-
-
-	Accel_GetProcessedData(&rawValues);
-	Accel_CalculateAngles(&rawValues, &angles);
-
-
-
-	bool timerR_50ms_finished = timerCheck(&timerR_50ms) >= MIN_TIME_ELAPSED / 50;
-	bool timerR_2000ms_finished = timerCheck(&timerR_2000ms) >= MAX_TIME_ELAPSED / 50;
-	bool timerC_50ms_finished = timerCheck(&timerC_50ms) >= MIN_TIME_ELAPSED / 50;
-	bool timerC_2000ms_finished = timerCheck(&timerC_2000ms) >= MAX_TIME_ELAPSED / 50;
-
-
-	if ( (((angles.roll > (ascii_to_int(posGrupos[4].roll) + 5) || angles.roll < (ascii_to_int(posGrupos[4].roll) - 5)) && timerR_50ms_finished) || timerR_2000ms_finished) )
-	{
-		timerReset(&timerR_50ms);
-		timerReset(&timerR_2000ms);
-
-		USBCom_SendString(">S4,A0,V"); // Rolido: Estación 4, Ángulo 0
-		int_to_ascii((int)angles.roll, posGrupos[4].roll);
-		USBCom_SendString(posGrupos[4].roll);
-		USBCom_SendString("\n"); // Fin de trama
-		SendCAN(posGrupos[4].roll, 'R', strlen(posGrupos[4].roll));
-	}
-	if ( (((angles.pitch > (ascii_to_int(posGrupos[4].pitch) + 5) || angles.pitch < (ascii_to_int(posGrupos[4].pitch) - 5)) && timerC_50ms_finished) || timerC_2000ms_finished) ) // falta chequear el tiempo
-	{
-		timerReset(&timerC_50ms);
-		timerReset(&timerC_2000ms);
-
-		USBCom_SendString(">S4,A1,V"); // Pitch: Estación 4, Ángulo 1
-		int_to_ascii((int)angles.pitch, posGrupos[4].pitch);
-		USBCom_SendString(posGrupos[4].pitch);
-		USBCom_SendString("\n"); // Fin de trama
-		SendCAN(posGrupos[4].pitch, 'C', strlen(posGrupos[4].pitch));
-	}
-}
-
-
-/*******************************************************************************
- *******************************************************************************
-                        LOCAL FUNCTION DEFINITIONS
- *******************************************************************************
- ******************************************************************************/
-
-void int_to_ascii(int n, char *s) {
-    int i = 0, sign;
-
-    if ((sign = n) < 0) n = -n; // Guardar signo y hacer positivo
-
-    // Extraer dígitos en orden inverso
-    do {
-        s[i++] = n % 10 + '0';
-    } while ((n /= 10) > 0);
-
-    if (sign < 0) s[i++] = '-';
-    s[i] = '\0';
-
-    // Invertir el string (porque los dígitos se sacaron al revés)
-    for (int j = 0, k = i-1; j < k; j++, k--) {
-        char temp = s[j];
-        s[j] = s[k];
-        s[k] = temp;
+    // TX: Leer desde la PC a través de USB y transmitir por el módem activo
+    if (USBCom_GetByte(&pc_tx_byte)) {
+#ifdef USE_VERSION_2
+        if (!FSK_V2_IsTransmitBusy()) {
+            FSK_V2_TransmitByte(pc_tx_byte);
+        }
+#else
+        if (!FSK_V1_IsTransmitBusy()) {
+            FSK_V1_TransmitByte(pc_tx_byte);
+        }
+#endif
     }
+
+    // RX: Leer desde el buffer circular de la aplicación y mandarlo a la PC
+    if (App_PopRxByte(&fsk_rx_byte)) {
+        ledOn(GREEN); // Destello verde al procesar un byte recibido
+        char tx_str[2] = {(char)fsk_rx_byte, '\0'};
+        USBCom_SendString(tx_str);
+    }
+
+#ifdef USE_VERSION_2
+    FSK_V2_PeriodicTask();
+#else
+    FSK_V1_PeriodicTask();
+#endif
 }
 
-
-int ascii_to_int(char * s) 
-{
-	int result = 1;
-	uint32_t aux = 0;
-	uint32_t j = 1;
-	uint32_t i = 0; 
-	if ( *(s) == '-')
-	{
-		result *= -1;
-		++s;
-	}
-	while (s[i+1] != '\0')
-	{
-	  j=j*10;
-	  i++;
-	}
-	while (*s != '\0')
-	{
-		aux += (int)((*s) - '0')*j;
-		j /= 10;
-		s++;
-	}
-	return result*aux;
-}
 /*******************************************************************************
+ * FUNCIONES AUXILIARES Y CALLBACKS (Guiados por Interrupción)
  ******************************************************************************/
 
+/**
+ * @brief Callback disparado en background por el driver del módem activo
+ * al decodificar un byte con éxito y verificar su paridad impar.
+ */
+static void App_FSK_Receive_Callback(uint8_t incoming_byte)
+{
+    // Empujamos el byte a la cola interna para liberarle la CPU a las interrupciones
+    App_PushRxByte(incoming_byte);
+}
+
+static bool App_PushRxByte(uint8_t byte)
+{
+    uint16_t next_head = (fsk_rx_head + 1) % RX_BUFFER_SIZE;
+    if (next_head == fsk_rx_tail) {
+        return false; // Buffer lleno (Overflow de aplicación)
+    }
+    fsk_rx_fifo[fsk_rx_head] = byte;
+    fsk_rx_head = next_head;
+    return true;
+}
+
+static bool App_PopRxByte(uint8_t *byte)
+{
+    if (fsk_rx_head == fsk_rx_tail) {
+        return false; // Buffer vacío
+    }
+    *byte = fsk_rx_fifo[fsk_rx_tail];
+    fsk_rx_tail = (fsk_rx_tail + 1) % RX_BUFFER_SIZE;
+    return true;
+}
