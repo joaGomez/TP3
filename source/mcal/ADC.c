@@ -5,23 +5,28 @@
 
 bool ADC_interrupt[2] = {false, false};
 
-
 void ADC_Init (void)
 {
-	SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
-	SIM->SCGC3 |= SIM_SCGC3_ADC1_MASK;
+    // [MODIFICACIÓN] 1. Habilitar y configurar el pin físico PTB2 (A0)
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+    PORTB->PCR[2] = PORT_PCR_MUX(0);      // Modo analógico para PTB2
 
-	NVIC_EnableIRQ(ADC0_IRQn);
-	NVIC_EnableIRQ(ADC1_IRQn);
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
+    SIM->SCGC3 |= SIM_SCGC3_ADC1_MASK;
 
-	ADC0->CFG1 = ADC_CFG1_ADIV(0x00);
-	ADC1->CFG1 = ADC_CFG1_ADIV(0x00);
+    NVIC_EnableIRQ(ADC0_IRQn);
+    NVIC_EnableIRQ(ADC1_IRQn);
 
-	ADC_SetResolution(ADC0, ADC_b12);
-	ADC_SetCycles(ADC0, ADC_c4);
-	ADC_Calibrate(ADC0);
+    ADC0->CFG1 = ADC_CFG1_ADIV(0x00);
+    ADC1->CFG1 = ADC_CFG1_ADIV(0x00);
 
+    ADC_SetResolution(ADC0, ADC_b12); // 12 bits de resolución (0 a 4095)
+    ADC_SetCycles(ADC0, ADC_c4);
+    ADC_Calibrate(ADC0);
 
+    // [MODIFICACIÓN] 2. Seleccionar el canal 12 (que corresponde a PTB2)
+    // Nota: Como no estamos usando DMA todavía, escribir este registro inicia una conversión de inmediato.
+    ADC0->SC1[0] = ADC_SC1_ADCH(12);
 }
 
 
