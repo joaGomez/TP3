@@ -7,6 +7,7 @@
 #include "MK64F12.h"
 #include "mcal/DAC.h"
 #include "mcal/DMA.h"
+#include "mcal/ADC.h"
 #include <math.h>
 #include <stddef.h>
 
@@ -64,6 +65,7 @@ void FSK_V1_Init(fsk_v1_rx_callback_t rx_cb)
     DAC_Init();
     DMA_Init();
     PIT_Baudrate_Init();
+    ADC_Init();
 }
 
 bool FSK_V1_TransmitByte(uint8_t data)

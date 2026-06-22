@@ -19,8 +19,8 @@
 // ============================================================================
 // CONFIGURACIÓN DE SELECCIÓN DE ENTREGA
 // ============================================================================
-#define USE_VERSION_2   // <-- Descomentar para compilar la V2 (PIT + CMP + FTM)
-// #define USE_VERSION_1   // <-- Descomentar para compilar la V1 (ADC + DAC + DMA)
+// #define USE_VERSION_2   // <-- Descomentar para compilar la V2 (PIT + CMP + FTM)
+#define USE_VERSION_1   // <-- Descomentar para compilar la V1 (ADC + DAC + DMA)
 
 
 
